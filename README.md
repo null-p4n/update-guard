@@ -1,4 +1,3 @@
-```markdown
 # 🛡️ Update Guard
 
 > **"Don't blindly `apt upgrade`."**
@@ -8,7 +7,6 @@ It **stages** candidate updates, **verifies** their integrity, **scans** them fo
 
 Think of it as a **pre-flight check** for your infrastructure updates.
 
----
 
 ## ✨ What it does (in 30 seconds)
 
@@ -23,11 +21,10 @@ Think of it as a **pre-flight check** for your infrastructure updates.
 | 🤖 **Chatter** | Uses LLM APIs (Gemini/OpenRouter) to surface public security discourse |
 | 📊 **Decide** | Emits a human-readable risk report + machine-friendly exit code |
 
----
 
 ## 🏗️ Architecture
 
-```
+
 ┌─────────────────┐     ┌─────────────────┐
 │  apt-get -s     │────▶│  Stage .debs    │
 │  docker ps      │     │  (sandbox)      │
@@ -52,9 +49,9 @@ Think of it as a **pre-flight check** for your infrastructure updates.
                     │  Exit 0 = clean     │
                     │  Exit 3 = CRITICAL  │
                     └─────────────────────┘
-```
 
----
+
+
 
 ## 🚀 Quick Start
 
@@ -256,15 +253,7 @@ Pull requests welcome! Areas we'd love help with:
 - Additional reputation sources (Snyk, OSV, NVD API)
 - Packaging (`.deb`, `.rpm`, AUR, Homebrew)
 
----
-
-## 📜 License
-
-MIT — see [LICENSE](LICENSE).
-
----
 
 <p align="center">
   <i>Built for people who sleep better knowing their upgrades were checked first.</i>
 </p>
-```
