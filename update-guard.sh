@@ -67,31 +67,43 @@ DEBUG_LOG="$STATE_DIR/reports/debug-$TS.log"
 
 dbg() { [[ "$DEBUG" == "1" ]] && echo "[DEBUG $(date +%T)] $*" | tee -a "$DEBUG_LOG" >&2; return 0; }
 
+# Strip API keys / tokens out of anything before it hits a log line. Handles
+# ?key=..., ?apikey=..., x-apikey headers pasted into a string, and bearer
+# tokens, without needing to know the exact secret value in advance.
+redact() {
+    sed -E \
+        -e 's/([?&](key|apikey|api_key|token)=)[^&[:space:]"'"'"']+/\1REDACTED/gI' \
+        -e 's/(Bearer|Authorization:[[:space:]]*Bearer)[[:space:]]+[A-Za-z0-9._~+\/=-]+/\1 REDACTED/gI' \
+        -e 's/(x-apikey:[[:space:]]*)[^[:space:]"'"'"']+/\1REDACTED/gI'
+}
+
+dbg_safe() { [[ "$DEBUG" == "1" ]] && printf '%s\n' "$*" | redact | { echo -n "[DEBUG $(date +%T)] "; cat; } | tee -a "$DEBUG_LOG" >&2; return 0; }
+
 # -----------------------------------------------------------------------------
 # LOCKING (prevent overlapping scheduled runs)
 # -----------------------------------------------------------------------------
+# Uses flock on a dedicated file descriptor rather than a hand-rolled PID
+# file. A PID file is racy: if the recorded PID has since been reused by an
+# unrelated process, `kill -0 $pid` succeeds and update-guard refuses to run
+# even though nothing is actually holding the lock. flock is atomic and
+# doesn't have that failure mode, and the lock is released automatically
+# even if the script is killed.
+LOCK_FD=9
 acquire_lock() {
-    if [[ -f "$LOCK_FILE" ]]; then
-        local pid
-        pid=$(cat "$LOCK_FILE" 2>/dev/null || true)
-        if [[ -n "${pid:-}" ]]; then
-            if kill -0 "$pid" 2>/dev/null; then
-                echo "ERROR: Another instance (PID $pid) is already running. Exiting." >&2
-                exit 2
-            elif [[ -d "/proc/$pid" ]]; then
-                echo "ERROR: Another instance (PID $pid) exists (permission denied to signal). Exiting." >&2
-                exit 2
-            fi
-            dbg "Stale lock file found (PID $pid dead), removing"
-        fi
-        rm -f "$LOCK_FILE"
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        local holder
+        holder=$(cat "$LOCK_FILE" 2>/dev/null || true)
+        echo "ERROR: Another instance is already running (lock held${holder:+, last PID $holder}). Exiting." >&2
+        exit 2
     fi
-    echo $$ > "$LOCK_FILE"
-    dbg "Lock acquired (PID $$)"
+    echo $$ >&9
+    dbg "Lock acquired (PID $$, fd $LOCK_FD)"
 }
 
 release_lock() {
-    rm -f "$LOCK_FILE"
+    flock -u 9 2>/dev/null || true
+    exec 9>&- 2>/dev/null || true
     dbg "Lock released"
 }
 
@@ -109,18 +121,18 @@ curl_json() {
         local curl_stderr
         curl_stderr=$(mktemp)
         status=$(curl -sS -o "$tmp" -w '%{http_code}' "$url" "$@" 2>"$curl_stderr") || status="000"
-        [[ "$DEBUG" == "1" && -s "$curl_stderr" ]] && dbg "curl stderr: $(cat "$curl_stderr")"
+        [[ "$DEBUG" == "1" && -s "$curl_stderr" ]] && dbg_safe "curl stderr: $(cat "$curl_stderr")"
         rm -f "$curl_stderr"
 
         body=$(cat "$tmp" 2>/dev/null || true); rm -f "$tmp"
 
         if [[ "$status" -ge 200 && "$status" -lt 300 ]]; then
-            dbg "GET/POST $url -> HTTP $status (attempt $attempt/$max_attempts)"
+            dbg_safe "GET/POST $url -> HTTP $status (attempt $attempt/$max_attempts)"
             echo "$body"
             return 0
         fi
 
-        dbg "GET/POST $url -> HTTP $status (attempt $attempt/$max_attempts), body: ${body:0:200}"
+        dbg_safe "GET/POST $url -> HTTP $status (attempt $attempt/$max_attempts), body: ${body:0:200}"
 
         if [[ "$status" == "503" || "$status" == "429" || "$status" == "000" ]]; then
             if (( attempt < max_attempts )); then
@@ -132,7 +144,7 @@ curl_json() {
             fi
         fi
 
-        dbg "NON-2xx RESPONSE ($status) for $url — giving up. Full body was: $body"
+        dbg_safe "NON-2xx RESPONSE ($status) for $url — giving up. Full body was: $body"
         echo '{}'
         return 1
     done
@@ -364,6 +376,40 @@ docker_diff_against_previous() {
 # -----------------------------------------------------------------------------
 # REPUTATION & AI
 # -----------------------------------------------------------------------------
+
+# Debian Security Tracker's JSON feed is tens of MB. reputation_check() used
+# to re-fetch it from scratch for every single candidate package, which is
+# slow and needlessly hammers their servers on hosts with a lot of pending
+# updates. Fetch it once per run and slice per-package lookups out of the
+# cached copy instead.
+DEBIAN_TRACKER_CACHE=""
+_debian_tracker_data() {
+    if [[ -z "$DEBIAN_TRACKER_CACHE" ]]; then
+        local cache_file="$STATE_DIR/reports/.debian-tracker-cache-$TS.json"
+        dbg "Fetching Debian Security Tracker feed (cached for the rest of this run)"
+        curl_json "$DEBIAN_TRACKER_API" > "$cache_file" || true
+        DEBIAN_TRACKER_CACHE="$cache_file"
+    fi
+    echo "$DEBIAN_TRACKER_CACHE"
+}
+
+# Map a deps.dev-style ecosystem name to the value the GHSA API expects.
+# deps.dev and GHSA don't always agree on ecosystem naming.
+_ghsa_ecosystem() {
+    case "$1" in
+        pypi)     echo "pip" ;;
+        golang)   echo "go" ;;
+        cargo)    echo "rust" ;;
+        maven)    echo "maven" ;;
+        npm)      echo "npm" ;;
+        nuget)    echo "nuget" ;;
+        rubygems) echo "rubygems" ;;
+        composer) echo "composer" ;;
+        docker)   echo "" ;; # GHSA has no container-image ecosystem; skip
+        *)        echo "$1" ;;
+    esac
+}
+
 reputation_check() {
     local ecosystem="$1" pkg="$2" version="$3"
     local out="$STATE_DIR/reports/reputation-$pkg-$TS.json"
@@ -372,7 +418,9 @@ reputation_check() {
     local debian_resp="{}"
 
     if [[ "$ecosystem" == "debian" ]]; then
-        debian_resp=$(curl_json "$DEBIAN_TRACKER_API" | jq --arg p "$pkg" '.[$p] // {}') || true
+        local cache_file
+        cache_file=$(_debian_tracker_data)
+        debian_resp=$(jq --arg p "$pkg" '.[$p] // {}' "$cache_file" 2>/dev/null || echo "{}")
     else
         deps_dev_resp=$(curl_json "${DEPS_DEV_API}/systems/${ecosystem}/packages/${pkg}/versions/${version}") || true
     fi
@@ -380,11 +428,11 @@ reputation_check() {
     local kev_hit="unknown"
 
     local ghsa_resp="{}"
-    if [[ "$ecosystem" == "debian" ]]; then
-        dbg "Skipping GHSA for $pkg — ecosystem 'debian' is not a valid GHSA ecosystem value"
+    local ghsa_ecosystem
+    ghsa_ecosystem=$(_ghsa_ecosystem "$ecosystem")
+    if [[ "$ecosystem" == "debian" || -z "$ghsa_ecosystem" ]]; then
+        dbg "Skipping GHSA for $pkg — ecosystem '$ecosystem' has no GHSA equivalent"
     elif [[ -n "${GHSA_TOKEN:-}" ]]; then
-        local ghsa_ecosystem="$ecosystem"
-        [[ "$ecosystem" == "pypi" ]] && ghsa_ecosystem="pip"
         ghsa_resp=$(curl_json "${GHSA_API}?ecosystem=${ghsa_ecosystem}&affects=${pkg}" \
             -H "Authorization: Bearer ${GHSA_TOKEN}") || true
     else
@@ -604,6 +652,12 @@ decide() {
         while IFS=$'\t' read -r name image local_digest remote_digest; do
             if [[ "$remote_digest" == "unreachable" ]]; then
                 echo "[DOCKER] $name ($image) -> registry unreachable, skip this cycle" >> "$report"
+            elif [[ "$local_digest" == "none" ]]; then
+                # No local RepoDigest means this is a locally-built/tagged
+                # image that was never pulled from a registry. Comparing it
+                # against a same-named remote tag is meaningless and used to
+                # produce a false "NEW DIGEST AVAILABLE" on every run.
+                echo "[DOCKER] $name ($image) -> no local RepoDigest (locally built image), skipping comparison" >> "$report"
             elif [[ "$local_digest" != *"$remote_digest"* ]]; then
                 echo "[DOCKER] $name ($image) -> NEW DIGEST AVAILABLE: $remote_digest" >> "$report"
                 echo "[DOCKER]   -> eligible for pull + analysis-engine pass" >> "$report"
@@ -714,7 +768,7 @@ install_cron_job() {
 # CLEANUP & STATUS
 # -----------------------------------------------------------------------------
 cleanup_old_reports() {
-    local keep="${UPDATE_GUARD_KEEP_REPORTS:-30}"
+    local keep="$KEEP_REPORTS"
     dbg "Cleaning up reports older than $keep runs"
 
     find "$STATE_DIR/reports" -maxdepth 1 -type f \( -name "*.txt" -o -name "*.json" -o -name "*.log" \) \
@@ -761,7 +815,7 @@ Environment / Config (/etc/update-guard/config.env):
   UPDATE_GUARD_DEBUG        Set to 1 for verbose debug logging
 
 Dependencies: curl, jq, skopeo, docker, apt-get, dpkg-deb, sha256sum
-Optional:     debsig-verify, yara, git (for YARA rules)
+Optional:     debsig-verify, yara, git (for YARA rules), flock (for locking)
 EOF
 }
 
