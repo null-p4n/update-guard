@@ -68,7 +68,7 @@ Think of it as a **pre-flight check** for your infrastructure updates.
 
 ```bash
 sudo mkdir -p /usr/local/bin
-sudo curl -fsSL https://raw.githubusercontent.com/YOURNAME/update-guard/main/update-guard.sh \
+sudo curl -fsSL https://raw.githubusercontent.com/null-p4n/update-guard/main/update-guard.sh \
   -o /usr/local/bin/update-guard
 sudo chmod +x /usr/local/bin/update-guard
 ```
